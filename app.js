@@ -84,6 +84,8 @@ document.addEventListener('DOMContentLoaded', function () {
         const totalHours = parseFloat(document.getElementById('totalHours').value);
         const lunchBreak = parseFloat(document.getElementById('lunchBreak').value);
         const includeLunch = document.getElementById('includeLunch').checked;
+        const startTime = document.getElementById('startTime').value;
+        const maxHoursPerDay = parseFloat(document.getElementById('maxHoursPerDay').value);
 
         // Get selected days
         const selectedDays = [];
@@ -115,93 +117,148 @@ document.addEventListener('DOMContentLoaded', function () {
         });
 
         // Calculate schedule
-        const schedule = distributeHours(totalHours, selectedDays, constraints, lunchBreak, includeLunch);
+        const schedule = distributeHours(totalHours, selectedDays, constraints, lunchBreak, includeLunch, startTime, maxHoursPerDay);
 
         // Display schedule
         displaySchedule(schedule, lunchBreak, includeLunch);
     }
 
-    function distributeHours(totalHours, selectedDays, constraints, lunchBreak, includeLunch) {
+    function distributeHours(totalHours, selectedDays, constraints, lunchBreak, includeLunch, defaultStartTime, maxHoursPerDay) {
         // Start with equal distribution
         let hoursPerDay = totalHours / selectedDays.length;
         let schedule = {};
 
-        // Initialize schedule with equal hours
+        // Initialize schedule with equal hours (respecting max per day)
         selectedDays.forEach(day => {
+            const initialHours = Math.min(hoursPerDay, maxHoursPerDay);
             schedule[day] = {
-                hours: hoursPerDay,
-                startTime: '09:00',
-                endTime: calculateEndTime('09:00', hoursPerDay, lunchBreak, includeLunch)
+                hours: initialHours,
+                startTime: defaultStartTime,
+                endTime: calculateEndTime(defaultStartTime, initialHours, lunchBreak, includeLunch, maxHoursPerDay)
             };
         });
 
-        // Apply constraints
+        // Apply constraints FIRST - this is crucial
         constraints.forEach(constraint => {
             if (schedule[constraint.day]) {
                 if (constraint.type === 'until') {
-                    // Calculate hours based on end time
-                    const startHour = 9; // Default start at 9 AM
+                    // Calculate maximum hours available until constraint time
+                    const startHour = parseInt(schedule[constraint.day].startTime.split(':')[0]);
+                    const startMinute = parseInt(schedule[constraint.day].startTime.split(':')[1]);
                     const endHour = parseInt(constraint.time.split(':')[0]);
                     const endMinute = parseInt(constraint.time.split(':')[1]);
 
-                    let availableHours = (endHour + endMinute / 60) - startHour;
-                    if (includeLunch) {
+                    let availableHours = (endHour + endMinute / 60) - (startHour + startMinute / 60);
+                    if (availableHours < 0) availableHours += 24; // Handle overnight
+
+                    // Apply lunch break rule for continuous work (>= 6 hours)
+                    if (availableHours >= 6 && !includeLunch && lunchBreak > 0) {
                         availableHours -= lunchBreak;
                     }
 
-                    schedule[constraint.day].hours = Math.max(0, Math.min(schedule[constraint.day].hours, availableHours));
+                    // Set hours to the minimum of current hours and available hours
+                    schedule[constraint.day].hours = Math.min(
+                        schedule[constraint.day].hours,
+                        Math.min(availableHours, maxHoursPerDay)
+                    );
+
+                    // Force end time to be exactly the constraint time
                     schedule[constraint.day].endTime = constraint.time;
 
                 } else if (constraint.type === 'from') {
-                    // Calculate hours based on start time
-                    const startHour = parseInt(constraint.time.split(':')[0]);
-                    const startMinute = parseInt(constraint.time.split(':')[1]);
-                    const endHour = 17; // Default end at 5 PM
-
-                    let availableHours = endHour - (startHour + startMinute / 60);
-                    if (includeLunch) {
-                        availableHours -= lunchBreak;
-                    }
-
-                    schedule[constraint.day].hours = Math.max(0, Math.min(schedule[constraint.day].hours, availableHours));
+                    // Update start time and recalculate hours
                     schedule[constraint.day].startTime = constraint.time;
+                    // Hours will be adjusted in the redistribution phase
 
                 } else if (constraint.type === 'max') {
                     // Apply maximum hours constraint
-                    schedule[constraint.day].hours = Math.min(schedule[constraint.day].hours, constraint.hours);
+                    schedule[constraint.day].hours = Math.min(
+                        schedule[constraint.day].hours,
+                        Math.min(constraint.hours, maxHoursPerDay)
+                    );
                 }
 
-                // Recalculate end time based on new hours
-                schedule[constraint.day].endTime = calculateEndTime(
-                    schedule[constraint.day].startTime,
-                    schedule[constraint.day].hours,
-                    lunchBreak,
-                    includeLunch
-                );
+                // Recalculate end time based on new hours (except for "until" constraints)
+                if (constraint.type !== 'until') {
+                    schedule[constraint.day].endTime = calculateEndTime(
+                        schedule[constraint.day].startTime,
+                        schedule[constraint.day].hours,
+                        lunchBreak,
+                        includeLunch,
+                        maxHoursPerDay
+                    );
+                }
             }
         });
 
-        // Adjust hours to meet total (simple redistribution)
+        // Now redistribute hours to meet total
         const totalScheduledHours = Object.values(schedule).reduce((sum, day) => sum + day.hours, 0);
-        const difference = totalHours - totalScheduledHours;
+        let difference = totalHours - totalScheduledHours;
 
-        if (difference > 0) {
-            // Distribute remaining hours to days without max constraints
-            const daysWithoutMaxConstraints = selectedDays.filter(day => {
-                const constraint = constraints.find(c => c.day === day && c.type === 'max');
-                return !constraint || schedule[day].hours < constraint.hours;
+        if (difference !== 0) {
+            // Find days that can accept more hours
+            const adjustableDays = selectedDays.filter(day => {
+                const daySchedule = schedule[day];
+                const constraint = constraints.find(c => c.day === day);
+
+                // Check if day has constraints that limit hours
+                if (constraint) {
+                    if (constraint.type === 'until') {
+                        // For "until" constraints, check if we're already at the limit
+                        const startHour = parseInt(daySchedule.startTime.split(':')[0]);
+                        const startMinute = parseInt(daySchedule.startTime.split(':')[1]);
+                        const endHour = parseInt(daySchedule.endTime.split(':')[0]);
+                        const endMinute = parseInt(daySchedule.endTime.split(':')[1]);
+
+                        const currentHours = (endHour + endMinute / 60) - (startHour + startMinute / 60);
+                        const maxPossible = Math.min(maxHoursPerDay, currentHours + (difference > 0 ? difference : 0));
+
+                        return daySchedule.hours < maxPossible;
+                    }
+                    else if (constraint.type === 'max') {
+                        return daySchedule.hours < Math.min(constraint.hours, maxHoursPerDay);
+                    }
+                }
+
+                // No specific constraint, just check max per day
+                return daySchedule.hours < maxHoursPerDay;
             });
 
-            if (daysWithoutMaxConstraints.length > 0) {
-                const hoursToAdd = difference / daysWithoutMaxConstraints.length;
-                daysWithoutMaxConstraints.forEach(day => {
-                    schedule[day].hours += hoursToAdd;
-                    schedule[day].endTime = calculateEndTime(
-                        schedule[day].startTime,
-                        schedule[day].hours,
-                        lunchBreak,
-                        includeLunch
-                    );
+            if (adjustableDays.length > 0) {
+                const hoursPerAdjustableDay = difference / adjustableDays.length;
+
+                adjustableDays.forEach(day => {
+                    const daySchedule = schedule[day];
+                    const constraint = constraints.find(c => c.day === day);
+                    let maxIncrease = maxHoursPerDay - daySchedule.hours;
+
+                    if (constraint?.type === 'max') {
+                        maxIncrease = Math.min(constraint.hours, maxHoursPerDay) - daySchedule.hours;
+                    }
+                    else if (constraint?.type === 'until') {
+                        // Calculate maximum possible hours for "until" constraint
+                        const startHour = parseInt(daySchedule.startTime.split(':')[0]);
+                        const startMinute = parseInt(daySchedule.startTime.split(':')[1]);
+                        const endHour = parseInt(daySchedule.endTime.split(':')[0]);
+                        const endMinute = parseInt(daySchedule.endTime.split(':')[1]);
+
+                        const currentHours = (endHour + endMinute / 60) - (startHour + startMinute / 60);
+                        maxIncrease = Math.min(maxHoursPerDay, currentHours + Math.abs(difference)) - daySchedule.hours;
+                    }
+
+                    const actualIncrease = Math.min(Math.abs(hoursPerAdjustableDay), maxIncrease) * Math.sign(difference);
+                    daySchedule.hours += actualIncrease;
+
+                    // Recalculate end time
+                    if (constraint?.type !== 'until') {
+                        daySchedule.endTime = calculateEndTime(
+                            daySchedule.startTime,
+                            daySchedule.hours,
+                            lunchBreak,
+                            includeLunch,
+                            maxHoursPerDay
+                        );
+                    }
                 });
             }
         }
@@ -209,20 +266,26 @@ document.addEventListener('DOMContentLoaded', function () {
         return schedule;
     }
 
-    function calculateEndTime(startTime, hours, lunchBreak, includeLunch) {
+    function calculateEndTime(startTime, hours, lunchBreak, includeLunch, maxHoursPerDay = 24) {
         const [startHour, startMinute] = startTime.split(':').map(Number);
         let totalMinutes = startHour * 60 + startMinute;
 
-        // Add working hours
-        totalMinutes += hours * 60;
+        // Add working hours (respect max per day)
+        const actualHours = Math.min(hours, maxHoursPerDay);
 
-        // Add lunch break if not included in working hours
-        if (!includeLunch) {
+        // Check if lunch break is required (>= 6 hours of continuous work)
+        const requiresLunch = actualHours >= 6 && lunchBreak > 0;
+
+        // Add working hours
+        totalMinutes += actualHours * 60;
+
+        // Add lunch break if required and not included in working hours
+        if (requiresLunch && !includeLunch) {
             totalMinutes += lunchBreak * 60;
         }
 
         // Convert back to time string
-        const endHour = Math.floor(totalMinutes / 60);
+        const endHour = Math.floor(totalMinutes / 60) % 24;
         const endMinute = totalMinutes % 60;
 
         return `${endHour.toString().padStart(2, '0')}:${endMinute.toString().padStart(2, '0')}`;
@@ -231,6 +294,7 @@ document.addEventListener('DOMContentLoaded', function () {
     function displaySchedule(schedule, lunchBreak, includeLunch) {
         const container = document.getElementById('schedule-container');
         const summary = document.getElementById('summary');
+        const maxHoursPerDay = parseFloat(document.getElementById('maxHoursPerDay').value);
 
         // Clear previous schedule
         container.innerHTML = '';
@@ -248,17 +312,50 @@ document.addEventListener('DOMContentLoaded', function () {
             dayDiv.appendChild(dayName);
 
             if (daySchedule) {
-                // Create bar visualization
+                const totalHours = daySchedule.hours;
+                const hasLunch = lunchBreak > 0 && totalHours >= 6 && !includeLunch;
+
+                // Calculate time at work (including lunch if applicable)
+                const timeAtWork = totalHours + (hasLunch ? lunchBreak : 0);
+
+                // Create bar container
                 const barContainer = document.createElement('div');
                 barContainer.className = 'bar-container';
 
-                const bar = document.createElement('div');
-                bar.className = 'working-bar';
-                bar.style.width = `${daySchedule.hours * 20}px`; // Scale for visualization
-                bar.title = `${daySchedule.hours.toFixed(1)} hours (${daySchedule.startTime} - ${daySchedule.endTime})`;
-                bar.textContent = `${daySchedule.hours.toFixed(1)}h`;
+                // Create working hours segment
+                const workingBar = document.createElement('div');
+                workingBar.className = 'working-bar';
 
-                barContainer.appendChild(bar);
+                // Calculate widths based on maxHoursPerDay
+                const workingWidth = (totalHours / maxHoursPerDay) * 100;
+                const lunchWidth = hasLunch ? (lunchBreak / maxHoursPerDay) * 100 : 0;
+
+                workingBar.style.width = `${workingWidth}%`;
+                workingBar.title = `${totalHours.toFixed(1)} working hours (excluding lunch)`;
+                workingBar.textContent = `${totalHours.toFixed(1)}h`;
+
+                barContainer.appendChild(workingBar);
+
+                // Add lunch break segment if applicable
+                if (hasLunch) {
+                    const lunchBar = document.createElement('div');
+                    lunchBar.className = 'lunch-bar';
+                    lunchBar.style.width = `${lunchWidth}%`;
+                    lunchBar.title = `${lunchBreak}h lunch break`;
+                    lunchBar.textContent = `+${lunchBreak}h`;
+                    barContainer.appendChild(lunchBar);
+                }
+
+                // Add empty space to represent remaining capacity up to maxHoursPerDay
+                const remainingHours = maxHoursPerDay - timeAtWork;
+                if (remainingHours > 0) {
+                    const emptyBar = document.createElement('div');
+                    emptyBar.className = 'empty-bar';
+                    emptyBar.style.width = `${(remainingHours / maxHoursPerDay) * 100}%`;
+                    emptyBar.title = `${remainingHours.toFixed(1)}h available capacity`;
+                    barContainer.appendChild(emptyBar);
+                }
+
                 dayDiv.appendChild(barContainer);
 
                 // Display time range
@@ -267,15 +364,28 @@ document.addEventListener('DOMContentLoaded', function () {
                 timeRange.textContent = `${daySchedule.startTime} - ${daySchedule.endTime}`;
                 dayDiv.appendChild(timeRange);
 
-                // Display lunch info if applicable
-                if (lunchBreak > 0) {
-                    const lunchInfo = document.createElement('div');
-                    lunchInfo.className = 'lunch-info';
-                    lunchInfo.textContent = includeLunch ?
-                        `Includes ${lunchBreak}h lunch` :
-                        `+ ${lunchBreak}h lunch`;
-                    dayDiv.appendChild(lunchInfo);
+                // Display CLEAR time breakdown
+                const timeBreakdown = document.createElement('div');
+                timeBreakdown.className = 'time-breakdown';
+
+                if (hasLunch) {
+                    timeBreakdown.innerHTML = `
+                        <strong>Time at work:</strong> ${timeAtWork.toFixed(1)}h (${totalHours.toFixed(1)}h work + ${lunchBreak}h lunch)<br>
+                        <strong>Working hours:</strong> ${totalHours.toFixed(1)}h (excluding lunch)
+                    `;
+                } else if (includeLunch && lunchBreak > 0) {
+                    timeBreakdown.innerHTML = `
+                        <strong>Time at work:</strong> ${totalHours.toFixed(1)}h (includes ${lunchBreak}h lunch)<br>
+                        <strong>Working hours:</strong> ${(totalHours - lunchBreak).toFixed(1)}h (excluding lunch)
+                    `;
+                } else {
+                    timeBreakdown.innerHTML = `
+                        <strong>Time at work:</strong> ${totalHours.toFixed(1)}h<br>
+                        <strong>Working hours:</strong> ${totalHours.toFixed(1)}h (no lunch break)
+                    `;
                 }
+                dayDiv.appendChild(timeBreakdown);
+
             } else {
                 const notWorking = document.createElement('div');
                 notWorking.className = 'not-working';
@@ -291,11 +401,24 @@ document.addEventListener('DOMContentLoaded', function () {
         const totalDays = Object.keys(schedule).length;
         const avgHours = totalDays > 0 ? totalHours / totalDays : 0;
 
+        // Calculate total time at work (including lunch breaks where applicable)
+        let totalTimeAtWork = 0;
+        Object.values(schedule).forEach(day => {
+            if (day) {
+                const hasLunch = lunchBreak > 0 && day.hours >= 6 && !includeLunch;
+                totalTimeAtWork += day.hours + (hasLunch ? lunchBreak : 0);
+            }
+        });
+
         summary.innerHTML = `
             <h3>Summary</h3>
-            <p>Total working hours: ${totalHours.toFixed(1)} hours</p>
-            <p>Average per day: ${avgHours.toFixed(1)} hours</p>
-            <p>Lunch break: ${lunchBreak} hours ${includeLunch ? '(included in working hours)' : '(additional to working hours)'}</p>
+            <p><strong>Total time at work:</strong> ${totalTimeAtWork.toFixed(1)} hours (including lunch breaks where applicable)</p>
+            <p><strong>Total working hours:</strong> ${totalHours.toFixed(1)} hours (excluding lunch breaks)</p>
+            <p><strong>Average working hours per day:</strong> ${avgHours.toFixed(1)} hours</p>
+            <p><strong>Maximum hours per day:</strong> ${maxHoursPerDay} hours</p>
+            <p><strong>Lunch break policy:</strong> ${lunchBreak} hours ${includeLunch ? '(included in working hours)' : '(added separately for days with ≥6 hours continuous work)'}</p>
+            <p class="bar-legend">Bar Legend: <span class="legend-working">Working hours</span> <span class="legend-lunch">Lunch break</span> <span class="legend-empty">Available capacity</span></p>
+            <p class="note"><strong>Note:</strong> "Time at work" includes both working hours and lunch breaks. "Working hours" excludes lunch breaks.</p>
         `;
     }
 });
